@@ -92,9 +92,44 @@ async function checkSupabase() {
   return out;
 }
 
+// Verifies the token actually works and names the connected account — the
+// quickest way to confirm a handle switch took effect.
+async function checkInstagram() {
+  const token = process.env.INSTAGRAM_ACCESS_TOKEN;
+  const out: Record<string, unknown> = {
+    tokenConfigured: Boolean(token),
+    verifyTokenConfigured: Boolean(process.env.INSTAGRAM_VERIFY_TOKEN),
+  };
+  if (!token) return out;
+  try {
+    const base =
+      process.env.INSTAGRAM_GRAPH_BASE_URL ?? "https://graph.instagram.com/v24.0";
+    const r = await fetch(`${base}/me?fields=id,username&access_token=${token}`);
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.id) {
+      out.tokenValid = true;
+      out.connectedAccount = d.username ? `@${d.username}` : d.id;
+      out.accountId = d.id;
+    } else {
+      out.tokenValid = false;
+      out.error = `HTTP ${r.status}: ${d?.error?.message ?? "unknown"}`;
+      if (d?.error?.code === 190) {
+        out.diagnosis = "Token expired or revoked — generate a new one in the Meta App Dashboard.";
+      }
+    }
+  } catch (e) {
+    out.tokenValid = false;
+    out.error = e instanceof Error ? e.message : String(e);
+  }
+  return out;
+}
+
 export async function GET() {
   const sha = process.env.VERCEL_GIT_COMMIT_SHA ?? null;
-  const supabaseStatus = await checkSupabase();
+  const [supabaseStatus, instagramStatus] = await Promise.all([
+    checkSupabase(),
+    checkInstagram(),
+  ]);
 
   return Response.json({
     ok: true,
@@ -115,9 +150,6 @@ export async function GET() {
       },
     },
     supabase: supabaseStatus,
-    instagram: {
-      tokenConfigured: Boolean(process.env.INSTAGRAM_ACCESS_TOKEN),
-      verifyTokenConfigured: Boolean(process.env.INSTAGRAM_VERIFY_TOKEN),
-    },
+    instagram: instagramStatus,
   });
 }
