@@ -111,7 +111,7 @@ if (!GM_KEY) {
 } else {
   const base = "https://generativelanguage.googleapis.com/v1beta/openai";
   let dailyExhausted = false;
-  for (const model of [...new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"].filter(Boolean))]) {
+  for (const model of [...new Set([GEMINI_MODEL, "gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"].filter(Boolean))]) {
     const r = await probe(base, GM_KEY, model);
     if (r.ok) { ok(`${model} → "${r.reply.slice(0, 80)}"`); anyModelWorks = true; }
     else { if (r.quota === "daily") dailyExhausted = true; warn(`${model} unavailable (${r.why})`); }
