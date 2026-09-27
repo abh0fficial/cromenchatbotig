@@ -101,26 +101,54 @@ async function checkInstagram() {
     verifyTokenConfigured: Boolean(process.env.INSTAGRAM_VERIFY_TOKEN),
   };
   if (!token) return out;
-  try {
-    const base =
-      process.env.INSTAGRAM_GRAPH_BASE_URL ?? "https://graph.instagram.com/v24.0";
-    const r = await fetch(`${base}/me?fields=id,username&access_token=${token}`);
-    const d = await r.json().catch(() => ({}));
-    if (r.ok && d.id) {
-      out.tokenValid = true;
-      out.connectedAccount = d.username ? `@${d.username}` : d.id;
-      out.accountId = d.id;
-    } else {
-      out.tokenValid = false;
-      out.error = `HTTP ${r.status}: ${d?.error?.message ?? "unknown"}`;
-      if (d?.error?.code === 190) {
-        out.diagnosis = "Token expired or revoked — generate a new one in the Meta App Dashboard.";
+
+  const base =
+    process.env.INSTAGRAM_GRAPH_BASE_URL ?? "https://graph.instagram.com/v24.0";
+
+  // Instagram Business Login exposes user_id on /me, not id, and rejects an
+  // unknown field with "Unsupported request - method type: get". Try the
+  // documented shapes and report the first that answers.
+  // field list per attempt; null means request no fields at all
+  const variants: (string | null)[] = [
+    "user_id,username",
+    "id,username",
+    "username",
+    null,
+  ];
+
+  const errors: string[] = [];
+  for (const fields of variants) {
+    const path = fields ? `me?fields=${fields}` : "me";
+    try {
+      const url = new URL(`${base}/me`);
+      if (fields) url.searchParams.set("fields", fields);
+      url.searchParams.set("access_token", token);
+      const r = await fetch(url.toString());
+      const d = await r.json().catch(() => ({}));
+      if (r.ok && (d.user_id || d.id || d.username)) {
+        out.tokenValid = true;
+        out.connectedAccount = d.username ? `@${d.username}` : String(d.user_id ?? d.id);
+        out.accountId = String(d.user_id ?? d.id ?? "");
+        out.probeUsed = path;
+        return out;
       }
+      errors.push(`${path} → HTTP ${r.status}: ${d?.error?.message ?? "no data"}`);
+      if (d?.error?.code === 190) {
+        out.tokenValid = false;
+        out.errors = errors;
+        out.diagnosis =
+          "Token expired or revoked (code 190) — generate a new one in the Meta App Dashboard.";
+        return out;
+      }
+    } catch (e) {
+      errors.push(`${path} → ${e instanceof Error ? e.message : String(e)}`);
     }
-  } catch (e) {
-    out.tokenValid = false;
-    out.error = e instanceof Error ? e.message : String(e);
   }
+
+  out.tokenValid = false;
+  out.errors = errors;
+  out.note =
+    "Could not read the profile, which does NOT by itself mean the token cannot send messages — sending uses POST /me/messages. Check the Vercel logs for a reply attempt.";
   return out;
 }
 
