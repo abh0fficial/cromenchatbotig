@@ -38,14 +38,37 @@ async function checkSupabase() {
     }
 
     const probe = `__healthcheck_${Date.now()}`;
+    // Insert the SAME shape the webhook uses, not just igsid. A table missing
+    // any profile column accepts the minimal row and fails the real one, which
+    // would report healthy while the bot silently lost its memory.
+    const fullRow = {
+      igsid: probe,
+      name: "healthcheck",
+      username: "healthcheck",
+      profile_pic: null,
+      follower_count: 0,
+      is_user_follow_business: null,
+      is_business_follow_user: null,
+    };
     const { data, error: wErr } = await supabase
       .from("instagram_conversations")
-      .insert({ igsid: probe })
+      .insert(fullRow)
       .select()
       .single();
     if (wErr) {
       out.writable = `NO — ${wErr.code ?? ""}: ${wErr.message}`;
       out.memory = "BROKEN: the bot cannot store messages, so it will greet on every message";
+      // Narrow it down: does a bare row work where the full one does not?
+      const { data: bare, error: bareErr } = await supabase
+        .from("instagram_conversations")
+        .insert({ igsid: probe })
+        .select()
+        .single();
+      if (!bareErr) {
+        out.diagnosis =
+          "A minimal row inserts but the full profile row does not — your instagram_conversations table is missing columns. Apply supabase/schema.sql.";
+        await supabase.from("instagram_conversations").delete().eq("id", bare.id);
+      }
     } else {
       out.writable = "yes";
       out.memory = "ok";
