@@ -108,7 +108,34 @@ if (working) {
     warn(`Consider setting AI_MODEL=${working} in .env.local.`);
   }
 } else {
-  bad("No model responded — check OPENROUTER_API_KEY and your credit/rate limits.");
+  bad("No model responded.");
+  // Every model failed — find out what this key can actually use.
+  try {
+    const r = await fetch("https://openrouter.ai/api/v1/models", {
+      headers: { Authorization: `Bearer ${OR_KEY}` },
+    });
+    if (r.status === 401) {
+      bad("OPENROUTER_API_KEY is invalid or revoked (HTTP 401). Create a new key.");
+    } else if (r.ok) {
+      const models = (await r.json()).data ?? [];
+      const free = models
+        .filter((m) => m.id.endsWith(":free") && (m.architecture?.output_modalities ?? ["text"]).includes("text"))
+        .map((m) => m.id)
+        .sort();
+      console.log(`\n  Your key is valid. ${models.length} models available, ${free.length} free.`);
+      if (free.length) {
+        console.log("  Free text models you can set as AI_MODEL:");
+        for (const id of free.slice(0, 20)) console.log(`    ${id}`);
+        if (free.length > 20) console.log(`    ...and ${free.length - 20} more`);
+        console.log("\n  If the models above work but the cascade failed, you are rate-limited.");
+        console.log("  Add credit at https://openrouter.ai/credits and use a paid model.");
+      }
+    } else {
+      warn(`Could not list models (HTTP ${r.status}).`);
+    }
+  } catch (e) {
+    warn(`Could not reach the model catalog: ${e.message}`);
+  }
 }
 
 // --- 4. Instagram token ----------------------------------------------------

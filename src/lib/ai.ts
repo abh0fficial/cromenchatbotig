@@ -51,6 +51,8 @@ export async function getAIResponse(
     ...messages,
   ];
 
+  const failures: string[] = [];
+
   for (const model of getFallbackModels()) {
     try {
       const completion = await getOpenAI().chat.completions.create({
@@ -64,14 +66,25 @@ export async function getAIResponse(
       const reply = cleanReply(completion.choices[0]?.message?.content || "");
       if (reply) return reply;
 
+      failures.push(`${model}: empty reply`);
       console.warn(`Model ${model} returned an empty reply, trying next...`);
     } catch (err: unknown) {
       const status = (err as { status?: number }).status;
       if (status !== undefined && !RETRYABLE_STATUSES.has(status)) throw err;
+      failures.push(`${model}: HTTP ${status ?? "network error"}`);
       console.warn(`Model ${model} failed with ${status ?? "network error"}, trying next...`);
     }
   }
 
-  // Every model failed — keep the lead warm instead of going silent.
+  // Every model failed. Log loudly — this is the one path that sends a
+  // non-answer to a customer, so it must be obvious in the server logs.
+  console.error(
+    `All ${failures.length} model(s) failed, sending fallback message. ` +
+      `Attempts: ${failures.join(" | ")}. ` +
+      `404 = model ID retired or wrong; 429 = rate-limited (add OpenRouter credit); ` +
+      `401 = bad OPENROUTER_API_KEY. Run "npm run doctor" to diagnose.`
+  );
+
+  // Keep the lead warm instead of going silent.
   return "Sorry, thoda technical issue aa gaya 🙏 Aap humein +91 91267 55555 par WhatsApp kar dijiye, ya apna number share kijiye — hamari team turant call karegi!";
 }
