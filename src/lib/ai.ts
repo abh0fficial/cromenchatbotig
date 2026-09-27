@@ -14,12 +14,14 @@ const GEMINI_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai/";
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
-// flash-lite first, deliberately: the free daily quotas are per-model and
-// flash-lite's is far larger, so it keeps answering after flash is exhausted.
-// Quality is indistinguishable for short DM replies.
+// Probed live against the API. The 2.5 line is refused for newer keys
+// ("no longer available to new users"), so the cascade is 3.x, ordered by
+// quality then latency, with fast lite models behind as cheap fallbacks.
 const GEMINI_MODELS = [
-  "gemini-2.5-flash-lite",
-  "gemini-2.5-flash",
+  "gemini-3.8-flash",
+  "gemini-3.6-flash",
+  "gemini-3.1-flash-lite",
+  "gemini-3.5-flash",
 ];
 
 const OPENROUTER_MODELS = [
@@ -121,6 +123,14 @@ function rejectsSystemRole(err: unknown): boolean {
   return /system/i.test(e.message ?? "");
 }
 
+// Not every Gemini model accepts reasoning_effort — gemini-3.5-flash-lite
+// returns 400 for it while answering fine without.
+function rejectsReasoningEffort(err: unknown): boolean {
+  const e = err as { status?: number; message?: string };
+  if (e.status !== 400) return false;
+  return /reasoning|thinking|thought/i.test(e.message ?? "");
+}
+
 export async function getAIResponse(
   messages: { role: "user" | "assistant"; content: string }[]
 ) {
@@ -154,6 +164,8 @@ export async function getAIResponse(
       ...(provider === "gemini" ? { reasoning_effort: "none" } : {}),
     };
 
+    // A 400 from one unsupported parameter should not lose the model, so drop
+    // the offending part and try again rather than moving on.
     let completion;
     try {
       completion = await client.chat.completions.create({
@@ -161,12 +173,22 @@ export async function getAIResponse(
         messages: payload,
       } as CreateParams);
     } catch (err: unknown) {
-      if (!rejectsSystemRole(err)) throw err;
-      console.warn(`${label} rejected the system role, retrying merged...`);
-      completion = await client.chat.completions.create({
-        ...params,
-        messages: withSystemMerged(payload),
-      } as CreateParams);
+      if (rejectsReasoningEffort(err)) {
+        console.warn(`${label} rejected reasoning_effort, retrying without it...`);
+        const { reasoning_effort: _dropped, ...rest } = params as Record<string, unknown>;
+        completion = await client.chat.completions.create({
+          ...rest,
+          messages: payload,
+        } as CreateParams);
+      } else if (rejectsSystemRole(err)) {
+        console.warn(`${label} rejected the system role, retrying merged...`);
+        completion = await client.chat.completions.create({
+          ...params,
+          messages: withSystemMerged(payload),
+        } as CreateParams);
+      } else {
+        throw err;
+      }
     }
 
     const choice = completion.choices[0];
