@@ -78,6 +78,14 @@ function getAttempts(): Attempt[] {
 // is a real bug and should surface.
 const RETRYABLE_STATUSES = new Set([402, 404, 408, 429, 500, 502, 503, 504]);
 
+// A rate limit is often just a burst. Retrying the same model briefly recovers
+// far more conversations than moving straight on, but Meta re-delivers a
+// webhook it considers slow, so the whole attempt chain stays inside a budget.
+const OVERALL_DEADLINE_MS = 15_000;
+const RATE_LIMIT_BACKOFF_MS = 2_500;
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
 // Some models (Qwen3, DeepSeek R1) emit visible reasoning. Never DM that.
 function cleanReply(raw: string): string {
   return raw
@@ -124,75 +132,117 @@ export async function getAIResponse(
   }
 
   const failures: string[] = [];
+  const startedAt = Date.now();
+  const timeLeft = () => OVERALL_DEADLINE_MS - (Date.now() - startedAt);
 
-  for (const { client, model, provider } of attempts) {
+  // Result of one model attempt: a reply to send, or nothing (reason recorded).
+  async function tryAttempt({ client, model, provider }: Attempt): Promise<string | null> {
     const label = `${provider}/${model}`;
+    const params = {
+      model,
+      // Headroom. Gemini 2.5 counts internal thinking against this budget, and
+      // when it spikes the visible reply gets cut mid-sentence. Length is
+      // controlled by the prompt, not by starving the token budget.
+      max_tokens: 1000,
+      temperature: 0.7,
+      // Turn Gemini's thinking off outright: this is a short chat reply, and
+      // thinking only adds latency and truncation risk. Gemini-only — other
+      // providers may reject an unknown parameter.
+      ...(provider === "gemini" ? { reasoning_effort: "none" } : {}),
+    };
+
+    let completion;
     try {
-      const params = {
-        model,
-        // Headroom. Gemini 2.5 counts internal thinking against this budget,
-        // and when it spikes the visible reply gets cut mid-sentence. Length
-        // is controlled by the prompt, not by starving the token budget.
-        max_tokens: 1000,
-        temperature: 0.7,
-        // Turn Gemini's thinking off outright: this is a short chat reply, and
-        // thinking only adds latency and truncation risk. Gemini-only — other
-        // providers may reject an unknown parameter.
-        ...(provider === "gemini" ? { reasoning_effort: "none" } : {}),
-      };
+      completion = await client.chat.completions.create({
+        ...params,
+        messages: payload,
+      } as CreateParams);
+    } catch (err: unknown) {
+      if (!rejectsSystemRole(err)) throw err;
+      console.warn(`${label} rejected the system role, retrying merged...`);
+      completion = await client.chat.completions.create({
+        ...params,
+        messages: withSystemMerged(payload),
+      } as CreateParams);
+    }
 
-      let completion;
-      try {
-        completion = await client.chat.completions.create({
-          ...params,
-          messages: payload,
-        } as CreateParams);
-      } catch (err: unknown) {
-        if (!rejectsSystemRole(err)) throw err;
-        console.warn(`${label} rejected the system role, retrying merged...`);
-        completion = await client.chat.completions.create({
-          ...params,
-          messages: withSystemMerged(payload),
-        } as CreateParams);
+    const choice = completion.choices[0];
+    const reply = cleanReply(choice?.message?.content || "");
+
+    // Hit the token ceiling: the text ends mid-sentence. Salvage the complete
+    // sentences; if there are none, move on rather than DM a fragment.
+    if (choice?.finish_reason === "length") {
+      const whole = reply.match(/^[\s\S]*[.!?…]|^[\s\S]*[\u0900-\u097F]।/);
+      const salvaged = whole?.[0]?.trim();
+      if (salvaged && salvaged.length > 40) {
+        console.warn(`${label} hit the token limit; trimmed to the last complete sentence.`);
+        return salvaged;
       }
+      failures.push(`${label}: truncated (finish_reason=length)`);
+      console.warn(`${label} was truncated with nothing salvageable, trying next...`);
+      return null;
+    }
 
-      const choice = completion.choices[0];
-      const reply = cleanReply(choice?.message?.content || "");
+    if (reply) return reply;
 
-      // Hit the token ceiling: the text ends mid-sentence. Salvage the
-      // complete sentences; if there are none, fall through to the next model
-      // rather than DM a fragment to a customer.
-      if (choice?.finish_reason === "length") {
-        const whole = reply.match(/^[\s\S]*[.!?…]|^[\s\S]*[\u0900-\u097F]।/);
-        const salvaged = whole?.[0]?.trim();
-        if (salvaged && salvaged.length > 40) {
-          console.warn(`${label} hit the token limit; trimmed to the last complete sentence.`);
-          return salvaged;
-        }
-        failures.push(`${label}: truncated (finish_reason=length)`);
-        console.warn(`${label} was truncated with nothing salvageable, trying next...`);
-        continue;
-      }
+    failures.push(`${label}: empty reply`);
+    console.warn(`${label} returned an empty reply, trying next...`);
+    return null;
+  }
 
+  // First pass over every model. A rate-limited one is set aside rather than
+  // waited on, so the other models are tried first.
+  const rateLimited: Attempt[] = [];
+
+  for (const attempt of attempts) {
+    const label = `${attempt.provider}/${attempt.model}`;
+    if (timeLeft() <= 0) {
+      failures.push("deadline reached");
+      break;
+    }
+    try {
+      const reply = await tryAttempt(attempt);
       if (reply) return reply;
-
-      failures.push(`${label}: empty reply`);
-      console.warn(`${label} returned an empty reply, trying next...`);
     } catch (err: unknown) {
       const status = (err as { status?: number }).status;
       if (status !== undefined && !RETRYABLE_STATUSES.has(status)) throw err;
+      if (status === 429) rateLimited.push(attempt);
       failures.push(`${label}: HTTP ${status ?? "network error"}`);
       console.warn(`${label} failed with ${status ?? "network error"}, trying next...`);
     }
   }
 
-  // Every model failed. Log loudly — this is the one path that sends a
+  // A rate limit is often just a burst, so back off once and retry those.
+  if (rateLimited.length > 0 && timeLeft() > RATE_LIMIT_BACKOFF_MS + 2_000) {
+    console.warn(
+      `${rateLimited.length} model(s) rate-limited; backing off ${RATE_LIMIT_BACKOFF_MS}ms and retrying once.`
+    );
+    await sleep(RATE_LIMIT_BACKOFF_MS);
+
+    for (const attempt of rateLimited) {
+      const label = `${attempt.provider}/${attempt.model}`;
+      if (timeLeft() <= 0) break;
+      try {
+        const reply = await tryAttempt(attempt);
+        if (reply) {
+          console.warn(`${label} succeeded on the rate-limit retry.`);
+          return reply;
+        }
+      } catch (err: unknown) {
+        const status = (err as { status?: number }).status;
+        if (status !== undefined && !RETRYABLE_STATUSES.has(status)) throw err;
+        failures.push(`${label}: HTTP ${status ?? "network error"} (retry)`);
+      }
+    }
+  }
+
+  // Everything failed. Log loudly — this is the one path that sends a
   // non-answer to a customer, so it must be obvious in the server logs.
   console.error(
-    `All ${failures.length} model(s) failed, sending fallback message. ` +
+    `All attempts failed, sending fallback message. ` +
       `Attempts: ${failures.join(" | ")}. ` +
-      `404 = model ID retired or wrong; 429 = rate-limited; ` +
-      `401/403 = bad API key. Run "npm run doctor" to diagnose.`
+      `404 = model ID retired or wrong; 429 = rate-limited (enable billing or ` +
+      `add an OpenRouter key); 401/403 = bad API key. Run "npm run doctor".`
   );
 
   // Keep the lead warm instead of going silent.
