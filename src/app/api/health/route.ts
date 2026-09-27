@@ -22,6 +22,21 @@ async function checkSupabase() {
 
     // A read can succeed while an insert fails (missing column, RLS, grants),
     // and it is the insert that memory depends on.
+    // Counts: if conversations grow in step with messages, each message is
+    // creating its own conversation and the bot has no history to work from.
+    const { count: convos } = await supabase
+      .from("instagram_conversations")
+      .select("*", { count: "exact", head: true });
+    const { count: msgs } = await supabase
+      .from("instagram_messages")
+      .select("*", { count: "exact", head: true });
+    out.conversationCount = convos ?? null;
+    out.messageCount = msgs ?? null;
+    if (convos && msgs && msgs / convos < 1.5) {
+      out.warning =
+        "Few messages per conversation — history may not be accumulating (check the igsid UNIQUE constraint).";
+    }
+
     const probe = `__healthcheck_${Date.now()}`;
     const { data, error: wErr } = await supabase
       .from("instagram_conversations")
@@ -34,7 +49,18 @@ async function checkSupabase() {
     } else {
       out.writable = "yes";
       out.memory = "ok";
-      await supabase.from("instagram_conversations").delete().eq("id", data.id);
+
+      // A second insert of the same igsid must be rejected with 23505. Without
+      // that constraint duplicate conversations pile up and history is lost.
+      const { error: dupErr } = await supabase
+        .from("instagram_conversations")
+        .insert({ igsid: probe });
+      out.igsidUnique =
+        dupErr?.code === "23505"
+          ? "yes"
+          : "NO — igsid is not UNIQUE, so duplicate conversations can hide history. Fix: alter table instagram_conversations add constraint instagram_conversations_igsid_key unique (igsid);";
+
+      await supabase.from("instagram_conversations").delete().eq("igsid", probe);
     }
   } catch (e) {
     out.error = e instanceof Error ? e.message : String(e);
