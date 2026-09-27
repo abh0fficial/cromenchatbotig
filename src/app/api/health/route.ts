@@ -5,8 +5,47 @@
  *
  * Reports only whether a credential is present, never its value.
  */
+import { supabase } from "@/lib/supabase";
+
+// Reads and writes the real tables, because a bot that cannot write has no
+// memory: every message then looks like the first and it greets again.
+async function checkSupabase() {
+  const out: Record<string, unknown> = {
+    configured: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY),
+    url: process.env.NEXT_PUBLIC_SUPABASE_URL ?? null,
+  };
+  try {
+    for (const table of ["instagram_conversations", "instagram_messages"]) {
+      const { error } = await supabase.from(table).select("id").limit(1);
+      out[table] = error ? `ERROR ${error.code ?? ""}: ${error.message}` : "readable";
+    }
+
+    // A read can succeed while an insert fails (missing column, RLS, grants),
+    // and it is the insert that memory depends on.
+    const probe = `__healthcheck_${Date.now()}`;
+    const { data, error: wErr } = await supabase
+      .from("instagram_conversations")
+      .insert({ igsid: probe })
+      .select()
+      .single();
+    if (wErr) {
+      out.writable = `NO — ${wErr.code ?? ""}: ${wErr.message}`;
+      out.memory = "BROKEN: the bot cannot store messages, so it will greet on every message";
+    } else {
+      out.writable = "yes";
+      out.memory = "ok";
+      await supabase.from("instagram_conversations").delete().eq("id", data.id);
+    }
+  } catch (e) {
+    out.error = e instanceof Error ? e.message : String(e);
+    out.memory = "BROKEN: Supabase unreachable";
+  }
+  return out;
+}
+
 export async function GET() {
   const sha = process.env.VERCEL_GIT_COMMIT_SHA ?? null;
+  const supabaseStatus = await checkSupabase();
 
   return Response.json({
     ok: true,
@@ -26,7 +65,7 @@ export async function GET() {
         model: process.env.AI_MODEL ?? "(cascade default)",
       },
     },
-    supabase: { configured: Boolean(process.env.SUPABASE_SERVICE_ROLE_KEY) },
+    supabase: supabaseStatus,
     instagram: {
       tokenConfigured: Boolean(process.env.INSTAGRAM_ACCESS_TOKEN),
       verifyTokenConfigured: Boolean(process.env.INSTAGRAM_VERIFY_TOKEN),
