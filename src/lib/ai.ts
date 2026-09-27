@@ -40,6 +40,9 @@ function getClient(baseURL: string, apiKey: string): OpenAI {
 
 type Attempt = { client: OpenAI; model: string; provider: string };
 
+// reasoning_effort is provider-specific and not in every SDK version's type.
+type CreateParams = OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+
 function getAttempts(): Attempt[] {
   const attempts: Attempt[] = [];
   const seen = new Set<string>();
@@ -127,24 +130,50 @@ export async function getAIResponse(
     try {
       const params = {
         model,
-        // Instagram DMs should stay short; also caps free-tier token burn.
-        max_tokens: 400,
+        // Headroom. Gemini 2.5 counts internal thinking against this budget,
+        // and when it spikes the visible reply gets cut mid-sentence. Length
+        // is controlled by the prompt, not by starving the token budget.
+        max_tokens: 1000,
         temperature: 0.7,
+        // Turn Gemini's thinking off outright: this is a short chat reply, and
+        // thinking only adds latency and truncation risk. Gemini-only — other
+        // providers may reject an unknown parameter.
+        ...(provider === "gemini" ? { reasoning_effort: "none" } : {}),
       };
 
       let completion;
       try {
-        completion = await client.chat.completions.create({ ...params, messages: payload });
+        completion = await client.chat.completions.create({
+          ...params,
+          messages: payload,
+        } as CreateParams);
       } catch (err: unknown) {
         if (!rejectsSystemRole(err)) throw err;
         console.warn(`${label} rejected the system role, retrying merged...`);
         completion = await client.chat.completions.create({
           ...params,
           messages: withSystemMerged(payload),
-        });
+        } as CreateParams);
       }
 
-      const reply = cleanReply(completion.choices[0]?.message?.content || "");
+      const choice = completion.choices[0];
+      const reply = cleanReply(choice?.message?.content || "");
+
+      // Hit the token ceiling: the text ends mid-sentence. Salvage the
+      // complete sentences; if there are none, fall through to the next model
+      // rather than DM a fragment to a customer.
+      if (choice?.finish_reason === "length") {
+        const whole = reply.match(/^[\s\S]*[.!?…]|^[\s\S]*[\u0900-\u097F]।/);
+        const salvaged = whole?.[0]?.trim();
+        if (salvaged && salvaged.length > 40) {
+          console.warn(`${label} hit the token limit; trimmed to the last complete sentence.`);
+          return salvaged;
+        }
+        failures.push(`${label}: truncated (finish_reason=length)`);
+        console.warn(`${label} was truncated with nothing salvageable, trying next...`);
+        continue;
+      }
+
       if (reply) return reply;
 
       failures.push(`${label}: empty reply`);
