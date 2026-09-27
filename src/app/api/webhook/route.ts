@@ -97,8 +97,22 @@ export async function POST(request: NextRequest) {
           .insert({ igsid, ...(profile ?? {}) })
           .select()
           .single();
-        if (error) throw new Error(error.message);
-        return data;
+        if (!error) return data;
+
+        // The profile columns are optional extras; igsid is the only one the
+        // conversation needs. If the table is missing any of them the insert
+        // fails, and without a conversation row there is no history — so the
+        // bot would greet on every message. Retry with igsid alone.
+        console.error(
+          `${tag} conversation insert with profile failed (${error.code ?? "?"}: ${error.message}); retrying with igsid only`
+        );
+        const { data: bare, error: bareErr } = await supabase
+          .from("instagram_conversations")
+          .insert({ igsid })
+          .select()
+          .single();
+        if (bareErr) throw new Error(bareErr.message);
+        return bare;
       });
       // Lost a race with a concurrent delivery — read the row it created.
       if (!conversation) {
@@ -162,18 +176,23 @@ export async function POST(request: NextRequest) {
     let history: Msg[] = [{ role: "user", content: text }];
     if (conversation) {
       const rows = await step("history fetch", async () => {
+        // Newest 20, then flipped back into chronological order. Ordering
+        // ascending with a limit returns the OLDEST 20 instead, so past 20
+        // messages the model would only ever see the start of the
+        // conversation and would keep replying as if it had just begun.
         const { data, error } = await supabase
           .from("instagram_messages")
-          .select("role, content")
+          .select("role, content, created_at")
           .eq("conversation_id", conversation!.id)
-          .order("created_at", { ascending: true })
+          .order("created_at", { ascending: false })
           .limit(20);
         if (error) throw new Error(error.message);
-        return data;
+        return (data ?? []).reverse();
       });
 
-      const cleaned = (rows ?? [])
-        .filter((m): m is Msg => !!m.content?.trim() && (m.role === "user" || m.role === "assistant"));
+      const cleaned: Msg[] = (rows ?? [])
+        .filter((m) => !!m.content?.trim() && (m.role === "user" || m.role === "assistant"))
+        .map((m) => ({ role: m.role as "user" | "assistant", content: m.content }));
 
       // The provider needs the exchange to end on the customer's turn.
       if (cleaned.length && cleaned[cleaned.length - 1].role === "user") {
