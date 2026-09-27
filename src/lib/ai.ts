@@ -14,9 +14,12 @@ const GEMINI_BASE_URL =
   "https://generativelanguage.googleapis.com/v1beta/openai/";
 const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
+// flash-lite first, deliberately: the free daily quotas are per-model and
+// flash-lite's is far larger, so it keeps answering after flash is exhausted.
+// Quality is indistinguishable for short DM replies.
 const GEMINI_MODELS = [
-  "gemini-2.5-flash",
   "gemini-2.5-flash-lite",
+  "gemini-2.5-flash",
 ];
 
 const OPENROUTER_MODELS = [
@@ -81,7 +84,7 @@ const RETRYABLE_STATUSES = new Set([402, 404, 408, 429, 500, 502, 503, 504]);
 // A rate limit is often just a burst. Retrying the same model briefly recovers
 // far more conversations than moving straight on, but Meta re-delivers a
 // webhook it considers slow, so the whole attempt chain stays inside a budget.
-const OVERALL_DEADLINE_MS = 15_000;
+const OVERALL_DEADLINE_MS = 12_000;
 const RATE_LIMIT_BACKOFF_MS = 2_500;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

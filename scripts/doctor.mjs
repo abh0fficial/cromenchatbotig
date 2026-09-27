@@ -86,6 +86,17 @@ async function probe(baseURL, key, model) {
     if (r.ok && j.choices?.[0]?.message?.content) {
       return { ok: true, reply: j.choices[0].message.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() };
     }
+    if (r.status === 429) {
+      const blob = JSON.stringify(j);
+      const daily = /per day|PerDay|RequestsPerDay/i.test(blob);
+      return {
+        ok: false,
+        quota: daily ? "daily" : "minute",
+        why: daily
+          ? "429 DAILY QUOTA EXHAUSTED — no requests left today"
+          : "429 rate-limited (per-minute)",
+      };
+    }
     return { ok: false, why: `HTTP ${r.status}${j.error?.message ? `: ${j.error.message.slice(0, 90)}` : ""}` };
   } catch (e) {
     return { ok: false, why: e.message };
@@ -99,12 +110,22 @@ if (!GM_KEY) {
   warn("GEMINI_API_KEY not set, skipping");
 } else {
   const base = "https://generativelanguage.googleapis.com/v1beta/openai";
+  let dailyExhausted = false;
   for (const model of [...new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"].filter(Boolean))]) {
     const r = await probe(base, GM_KEY, model);
     if (r.ok) { ok(`${model} → "${r.reply.slice(0, 80)}"`); anyModelWorks = true; }
-    else warn(`${model} unavailable (${r.why})`);
+    else { if (r.quota === "daily") dailyExhausted = true; warn(`${model} unavailable (${r.why})`); }
   }
-  if (!anyModelWorks) bad("Gemini answered nothing — check GEMINI_API_KEY at https://aistudio.google.com/apikey");
+  if (!anyModelWorks) {
+    bad("Gemini answered nothing.");
+    if (dailyExhausted) {
+      console.log("");
+      console.log("  >> The free daily quota is gone. It resets at midnight Pacific.");
+      console.log("  >> A bot answering real DMs needs billing enabled:");
+      console.log("  >> https://aistudio.google.com/apikey  ->  link a Cloud billing account");
+      console.log("  >> Until then only the first DM or two each day will get a reply.");
+    }
+  }
 }
 
 console.log("\n── OpenRouter (fallback) ──");
