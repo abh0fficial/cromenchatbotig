@@ -13,14 +13,34 @@ function getOpenAI(): OpenAI {
   return _openai;
 }
 
+// Tried in order. AI_MODEL (if set) goes first, then this cascade — so a
+// rate-limited or retired model never takes the bot offline.
+const DEFAULT_MODELS = [
+  "google/gemini-2.0-flash-exp:free",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "deepseek/deepseek-chat-v3-0324:free",
+  "qwen/qwen3-8b:free",
+  "mistralai/mistral-small-3.1-24b-instruct:free",
+];
+
 function getFallbackModels(): string[] {
-  return [
-    process.env.AI_MODEL,
-    "google/gemma-3-12b-it:free",
-    "google/gemma-3-4b-it:free",
-    "google/gemma-2-9b-it:free",
-    "mistralai/mistral-small-3.1-24b-instruct:free",
-  ].filter(Boolean) as string[];
+  const models = [process.env.AI_MODEL, ...DEFAULT_MODELS].filter(
+    Boolean
+  ) as string[];
+  // De-dupe in case AI_MODEL is already in the cascade
+  return [...new Set(models)];
+}
+
+// Retry on transient/availability errors; anything else (bad key, malformed
+// request) is a real bug and should surface.
+const RETRYABLE_STATUSES = new Set([402, 404, 408, 429, 500, 502, 503, 504]);
+
+// Some models (Qwen3, DeepSeek R1) emit visible reasoning. Never DM that.
+function cleanReply(raw: string): string {
+  return raw
+    .replace(/<think>[\s\S]*?<\/think>/gi, "")
+    .replace(/<\/?think>/gi, "")
+    .trim();
 }
 
 export async function getAIResponse(
@@ -33,15 +53,25 @@ export async function getAIResponse(
 
   for (const model of getFallbackModels()) {
     try {
-      const completion = await getOpenAI().chat.completions.create({ model, messages: payload });
-      return completion.choices[0]?.message?.content || "Sorry, I couldn't generate a response.";
+      const completion = await getOpenAI().chat.completions.create({
+        model,
+        messages: payload,
+        // Instagram DMs should stay short; also caps free-tier token burn.
+        max_tokens: 400,
+        temperature: 0.7,
+      });
+
+      const reply = cleanReply(completion.choices[0]?.message?.content || "");
+      if (reply) return reply;
+
+      console.warn(`Model ${model} returned an empty reply, trying next...`);
     } catch (err: unknown) {
       const status = (err as { status?: number }).status;
-      // Only fall through on rate-limit (429) or not-found (404), throw everything else
-      if (status !== 429 && status !== 404) throw err;
-      console.warn(`Model ${model} failed with ${status}, trying next...`);
+      if (status !== undefined && !RETRYABLE_STATUSES.has(status)) throw err;
+      console.warn(`Model ${model} failed with ${status ?? "network error"}, trying next...`);
     }
   }
 
-  return "Sorry, I'm temporarily unavailable. Please try again shortly.";
+  // Every model failed — keep the lead warm instead of going silent.
+  return "Sorry, thoda technical issue aa gaya 🙏 Aap humein +91 91267 55555 par WhatsApp kar dijiye, ya apna number share kijiye — hamari team turant call karegi!";
 }

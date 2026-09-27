@@ -10,7 +10,8 @@ The agent replies to Instagram DMs automatically, speaks **English and Hinglish*
 - **Cromen knowledge base** — brand story, full product range, materials, contact details, showroom hours, and the sales playbook live in `src/lib/system-prompt.ts`
 - **Dashboard** (`/`) — view all conversations, read message history, and take over any chat manually
 - **Agent / human mode** — switch a conversation to human mode to reply yourself
-- **Model fallback** — cascades through OpenRouter models if one is rate-limited
+- **Model fallback** — cascades through OpenRouter models if one is rate-limited or retired
+- **Connection doctor** — `npm run doctor` verifies Supabase, OpenRouter, and the Instagram token in one command
 
 ## Tech Stack
 
@@ -23,10 +24,23 @@ The agent replies to Instagram DMs automatically, speaks **English and Hinglish*
 
 ```bash
 npm install
+cp .env.example .env.local   # then fill in your credentials
+npm run doctor               # verify every service is connected
 npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000) for the dashboard.
+
+### Verifying the connection
+
+```bash
+npm run doctor
+```
+
+Checks that all env vars are set, both Supabase tables are reachable, the
+Instagram token is valid, and that a real completion comes back from
+OpenRouter — printing which model answered. Exits non-zero on failure, so it
+works in CI too.
 
 ## Environment Variables
 
@@ -50,7 +64,22 @@ AI_MODEL=
 
 ## Database Schema
 
-See `claude_code_prompt.md` for the `instagram_conversations` and `instagram_messages` table definitions.
+Apply `supabase/schema.sql` in the Supabase SQL editor (Dashboard > SQL Editor >
+New query). It creates `instagram_conversations` and `instagram_messages`, their
+indexes, and adds both tables to the `supabase_realtime` publication — without
+that last step the dashboard will not live-update.
+
+## AI Model
+
+`AI_MODEL` is tried first, then the cascade in `src/lib/ai.ts` falls through on
+rate limits (429), retired models (404), and upstream errors — so one bad model
+never takes the bot offline. Default: `google/gemini-2.0-flash-exp:free`.
+
+Free models are rate-limited. For production traffic, set `AI_MODEL` to a paid
+model (e.g. `google/gemini-2.5-flash`) and add credit on OpenRouter.
+
+Replies are capped at 400 tokens to keep DMs short, and any `<think>` reasoning
+some models emit is stripped before sending.
 
 ## Customising the Chatbot
 

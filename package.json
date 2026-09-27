@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "doctor": "node scripts/doctor.mjs"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.100.1",
