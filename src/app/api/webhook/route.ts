@@ -73,13 +73,19 @@ export async function POST(request: NextRequest) {
     console.log(`${tag} received: ${JSON.stringify(text.slice(0, 80))}`);
 
     // --- conversation ------------------------------------------------------
+    // Deliberately not maybeSingle: if the igsid unique constraint is missing
+    // the table can hold duplicates, and maybeSingle errors on more than one
+    // row. That would look like "no conversation", so a new one would be
+    // created per message and the bot would greet every time. Take the oldest.
     let conversation = await step("conversation lookup", async () => {
-      const { data } = await supabase
+      const { data, error } = await supabase
         .from("instagram_conversations")
         .select("*")
         .eq("igsid", igsid)
-        .maybeSingle();
-      return data;
+        .order("created_at", { ascending: true })
+        .limit(1);
+      if (error) throw new Error(error.message);
+      return data?.[0] ?? null;
     });
 
     const profile = await step("profile fetch", () => fetchInstagramProfile(igsid));
@@ -101,8 +107,9 @@ export async function POST(request: NextRequest) {
             .from("instagram_conversations")
             .select("*")
             .eq("igsid", igsid)
-            .maybeSingle();
-          return data;
+            .order("created_at", { ascending: true })
+            .limit(1);
+          return data?.[0] ?? null;
         });
       }
     } else if (profile) {
