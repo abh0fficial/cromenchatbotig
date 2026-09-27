@@ -3,6 +3,13 @@ import { supabase } from "@/lib/supabase";
 import { sendInstagramMessage, fetchInstagramProfile } from "@/lib/instagram";
 import { getAIResponse } from "@/lib/ai";
 
+// The AI chain alone may take ~12s. Vercel's default is 10s, which killed the
+// function mid-reply, so declare a ceiling that leaves room for the DB and the
+// Instagram send.
+export const maxDuration = 30;
+
+type Msg = { role: "user" | "assistant"; content: string };
+
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
   const mode = searchParams.get("hub.mode");
@@ -19,7 +26,6 @@ export async function GET(request: NextRequest) {
 export async function POST(request: NextRequest) {
   const body = await request.json();
 
-  // Only process instagram events
   if (body.object !== "instagram") {
     return Response.json({ status: "ignored" });
   }
@@ -31,12 +37,16 @@ export async function POST(request: NextRequest) {
     return Response.json({ status: "no_messaging" });
   }
 
-  // Skip echo messages (sent by our own page)
+  // Skip echoes of our own outgoing messages. is_echo is the documented flag;
+  // the sender check is a second line of defence, because processing our own
+  // message would have the bot reply to itself in a loop and burn the AI quota.
   if (messaging.message?.is_echo) {
     return Response.json({ status: "echo_ignored" });
   }
+  if (messaging.sender?.id && messaging.sender.id === entry?.id) {
+    return Response.json({ status: "self_ignored" });
+  }
 
-  // Only handle text messages
   if (!messaging.message?.text) {
     return Response.json({ status: "non_text" });
   }
@@ -44,97 +54,155 @@ export async function POST(request: NextRequest) {
   const igsid = messaging.sender.id;
   const text = messaging.message.text;
   const instagramMsgId = messaging.message.mid;
+  // Correlates every log line of one delivery, so a failing step is findable.
+  const tag = `[dm ${igsid}/${(instagramMsgId ?? "no-mid").slice(-8)}]`;
+
+  // Everything except the AI call and the send is best-effort. A customer
+  // waiting on a reply must not be dropped because a profile lookup or an
+  // analytics write failed, so each step logs and degrades instead of throwing.
+  async function step<T>(name: string, fn: () => Promise<T>): Promise<T | null> {
+    try {
+      return await fn();
+    } catch (err) {
+      console.error(`${tag} ${name} failed:`, err instanceof Error ? err.message : err);
+      return null;
+    }
+  }
 
   try {
-    // Find or create conversation
-    let { data: conversation } = await supabase
-      .from("instagram_conversations")
-      .select("*")
-      .eq("igsid", igsid)
-      .single();
+    console.log(`${tag} received: ${JSON.stringify(text.slice(0, 80))}`);
 
-    if (!conversation) {
-      // Fetch profile info on first message
-      const profile = await fetchInstagramProfile(igsid);
-      const { data: newConvo } = await supabase
+    // --- conversation ------------------------------------------------------
+    let conversation = await step("conversation lookup", async () => {
+      const { data } = await supabase
         .from("instagram_conversations")
-        .insert({ igsid, ...profile })
-        .select()
-        .single();
-      conversation = newConvo;
-    } else {
-      // Refresh profile on every message to keep data up to date
-      const profile = await fetchInstagramProfile(igsid);
-      await supabase
-        .from("instagram_conversations")
-        .update(profile)
-        .eq("id", conversation.id);
-      conversation = { ...conversation, ...profile };
-    }
-
-    if (!conversation) {
-      return Response.json({ error: "Failed to create conversation" }, { status: 500 });
-    }
-
-    // Store user message (ignore duplicates)
-    const { error: insertError } = await supabase.from("instagram_messages").insert({
-      conversation_id: conversation.id,
-      role: "user",
-      content: text,
-      instagram_msg_id: instagramMsgId,
+        .select("*")
+        .eq("igsid", igsid)
+        .maybeSingle();
+      return data;
     });
 
-    if (insertError?.code === "23505") {
-      // Duplicate message, ignore
-      return Response.json({ status: "duplicate" });
+    const profile = await step("profile fetch", () => fetchInstagramProfile(igsid));
+
+    if (!conversation) {
+      conversation = await step("conversation insert", async () => {
+        const { data, error } = await supabase
+          .from("instagram_conversations")
+          .insert({ igsid, ...(profile ?? {}) })
+          .select()
+          .single();
+        if (error) throw new Error(error.message);
+        return data;
+      });
+      // Lost a race with a concurrent delivery — read the row it created.
+      if (!conversation) {
+        conversation = await step("conversation re-read", async () => {
+          const { data } = await supabase
+            .from("instagram_conversations")
+            .select("*")
+            .eq("igsid", igsid)
+            .maybeSingle();
+          return data;
+        });
+      }
+    } else if (profile) {
+      await step("profile refresh", async () => {
+        await supabase
+          .from("instagram_conversations")
+          .update(profile)
+          .eq("id", conversation!.id);
+      });
     }
 
-    // Update conversation timestamp
-    await supabase
-      .from("instagram_conversations")
-      .update({ updated_at: new Date().toISOString() })
-      .eq("id", conversation.id);
-
-    // If mode is 'human', don't auto-reply
-    if (conversation.mode === "human") {
+    // Human has taken over — store only, never auto-reply.
+    if (conversation?.mode === "human") {
+      await step("store user message (human mode)", async () => {
+        await supabase.from("instagram_messages").insert({
+          conversation_id: conversation!.id,
+          role: "user",
+          content: text,
+          instagram_msg_id: instagramMsgId,
+        });
+      });
+      console.log(`${tag} human mode, stored without replying`);
       return Response.json({ status: "stored_for_human" });
     }
 
-    // Fetch conversation history (last 20 messages for context)
-    const { data: history } = await supabase
-      .from("instagram_messages")
-      .select("role, content")
-      .eq("conversation_id", conversation.id)
-      .order("created_at", { ascending: true })
-      .limit(20);
+    // --- store the incoming message, and drop Meta's re-deliveries ---------
+    if (conversation) {
+      const duplicate = await step("store user message", async () => {
+        const { error } = await supabase.from("instagram_messages").insert({
+          conversation_id: conversation!.id,
+          role: "user",
+          content: text,
+          instagram_msg_id: instagramMsgId,
+        });
+        // 23505 = unique violation on instagram_msg_id: Meta re-delivered a
+        // message we already answered. Replying again would double-send.
+        if (error?.code === "23505") return true;
+        if (error) throw new Error(error.message);
+        return false;
+      });
 
-    // Get AI response
-    const aiResponse = await getAIResponse(
-      (history || []).map((m) => ({
-        role: m.role as "user" | "assistant",
-        content: m.content,
-      }))
-    );
+      if (duplicate) {
+        console.log(`${tag} duplicate delivery, skipping`);
+        return Response.json({ status: "duplicate" });
+      }
+    }
 
-    // Send response via Instagram
+    // --- history ------------------------------------------------------------
+    // Without it the bot still answers, just without memory of earlier turns.
+    let history: Msg[] = [{ role: "user", content: text }];
+    if (conversation) {
+      const rows = await step("history fetch", async () => {
+        const { data, error } = await supabase
+          .from("instagram_messages")
+          .select("role, content")
+          .eq("conversation_id", conversation!.id)
+          .order("created_at", { ascending: true })
+          .limit(20);
+        if (error) throw new Error(error.message);
+        return data;
+      });
+
+      const cleaned = (rows ?? [])
+        .filter((m): m is Msg => !!m.content?.trim() && (m.role === "user" || m.role === "assistant"));
+
+      // The provider needs the exchange to end on the customer's turn.
+      if (cleaned.length && cleaned[cleaned.length - 1].role === "user") {
+        history = cleaned;
+      } else if (cleaned.length) {
+        history = [...cleaned, { role: "user", content: text }];
+      }
+    }
+
+    console.log(`${tag} asking the model with ${history.length} message(s)`);
+
+    // --- the two steps that actually matter --------------------------------
+    const aiResponse = await getAIResponse(history);
     await sendInstagramMessage(igsid, aiResponse);
+    console.log(`${tag} replied: ${JSON.stringify(aiResponse.slice(0, 80))}`);
 
-    // Store AI response
-    await supabase.from("instagram_messages").insert({
-      conversation_id: conversation.id,
-      role: "assistant",
-      content: aiResponse,
-    });
-
-    // Update conversation timestamp again
-    await supabase
-      .from("instagram_conversations")
-      .update({ updated_at: new Date().toISOString() })
-      .eq("id", conversation.id);
+    if (conversation) {
+      await step("store assistant message", async () => {
+        await supabase.from("instagram_messages").insert({
+          conversation_id: conversation!.id,
+          role: "assistant",
+          content: aiResponse,
+        });
+        await supabase
+          .from("instagram_conversations")
+          .update({ updated_at: new Date().toISOString() })
+          .eq("id", conversation!.id);
+      });
+    }
 
     return Response.json({ status: "replied" });
   } catch (error) {
-    console.error("Webhook error:", error);
-    return Response.json({ status: "error" }, { status: 500 });
+    // Only a failed AI call or a failed send reaches here. Return 200 so Meta
+    // does not re-deliver and burn the quota again on a message that will fail
+    // the same way; the log line above names the step.
+    console.error(`${tag} FAILED:`, error instanceof Error ? error.stack ?? error.message : error);
+    return Response.json({ status: "error" });
   }
 }
