@@ -33,3 +33,20 @@ create index if not exists idx_instagram_conversations_updated
 -- live-update, even though the subscription code is correct.
 alter publication supabase_realtime
   add table instagram_conversations, instagram_messages;
+
+-- ---------------------------------------------------------------------------
+-- SECURITY: row-level security
+--
+-- The dashboard uses the public anon key in the browser for Realtime, so that
+-- key is visible to anyone who opens the page. With RLS off, it can be used to
+-- read every customer conversation through the REST API.
+--
+-- The API routes use the service role key, which bypasses RLS, so the bot and
+-- the dashboard keep working with RLS on. The one trade-off: Realtime stops
+-- pushing updates to the browser, so the conversation list no longer
+-- auto-refreshes (it still loads on click and on reload).
+--
+-- Strongly recommended before taking real customer traffic:
+-- ---------------------------------------------------------------------------
+-- alter table instagram_conversations enable row level security;
+-- alter table instagram_messages      enable row level security;
