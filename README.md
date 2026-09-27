@@ -73,7 +73,7 @@ that last step the dashboard will not live-update.
 
 `AI_MODEL` is tried first, then the cascade in `src/lib/ai.ts` falls through on
 rate limits (429), retired models (404), and upstream errors — so one bad model
-never takes the bot offline. Default: `google/gemini-2.0-flash-exp:free`.
+never takes the bot offline. Default: `google/gemma-4-26b-a4b-it:free`.
 
 Free models are rate-limited. For production traffic, set `AI_MODEL` to a paid
 model (e.g. `google/gemini-2.5-flash`) and add credit on OpenRouter.

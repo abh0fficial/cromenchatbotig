@@ -67,6 +67,7 @@ for (const table of ["instagram_conversations", "instagram_messages"]) {
 console.log("\n── OpenRouter ──");
 const CASCADE = [
   AI_MODEL,
+  "google/gemma-4-26b-a4b-it:free",
   "google/gemini-2.0-flash-exp:free",
   "meta-llama/llama-3.3-70b-instruct:free",
   "deepseek/deepseek-chat-v3-0324:free",

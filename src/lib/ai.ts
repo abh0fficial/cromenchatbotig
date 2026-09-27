@@ -16,6 +16,7 @@ function getOpenAI(): OpenAI {
 // Tried in order. AI_MODEL (if set) goes first, then this cascade — so a
 // rate-limited or retired model never takes the bot offline.
 const DEFAULT_MODELS = [
+  "google/gemma-4-26b-a4b-it:free",
   "google/gemini-2.0-flash-exp:free",
   "meta-llama/llama-3.3-70b-instruct:free",
   "deepseek/deepseek-chat-v3-0324:free",
@@ -43,11 +44,35 @@ function cleanReply(raw: string): string {
     .trim();
 }
 
+type ChatMessage = { role: "system" | "user" | "assistant"; content: string };
+
+// Gemma-family models have no system role. Most providers accept one and
+// prepend it, but those that don't reject the request outright — so retry
+// with the prompt folded into the first user turn.
+function withSystemMerged(messages: ChatMessage[]): ChatMessage[] {
+  const convo = messages.filter((m) => m.role !== "system");
+  const firstUser = convo.findIndex((m) => m.role === "user");
+  if (firstUser === -1) {
+    return [{ role: "user", content: INSTAGRAM_SYSTEM_PROMPT }];
+  }
+  return convo.map((m, i) =>
+    i === firstUser
+      ? { ...m, content: `${INSTAGRAM_SYSTEM_PROMPT}\n\n---\n\nCustomer: ${m.content}` }
+      : m
+  );
+}
+
+function rejectsSystemRole(err: unknown): boolean {
+  const e = err as { status?: number; message?: string };
+  if (e.status !== 400) return false;
+  return /system/i.test(e.message ?? "");
+}
+
 export async function getAIResponse(
   messages: { role: "user" | "assistant"; content: string }[]
 ) {
-  const payload = [
-    { role: "system" as const, content: INSTAGRAM_SYSTEM_PROMPT },
+  const payload: ChatMessage[] = [
+    { role: "system", content: INSTAGRAM_SYSTEM_PROMPT },
     ...messages,
   ];
 
@@ -55,13 +80,25 @@ export async function getAIResponse(
 
   for (const model of getFallbackModels()) {
     try {
-      const completion = await getOpenAI().chat.completions.create({
-        model,
-        messages: payload,
-        // Instagram DMs should stay short; also caps free-tier token burn.
-        max_tokens: 400,
-        temperature: 0.7,
-      });
+      let completion;
+      try {
+        completion = await getOpenAI().chat.completions.create({
+          model,
+          messages: payload,
+          // Instagram DMs should stay short; also caps free-tier token burn.
+          max_tokens: 400,
+          temperature: 0.7,
+        });
+      } catch (err: unknown) {
+        if (!rejectsSystemRole(err)) throw err;
+        console.warn(`Model ${model} rejected the system role, retrying merged...`);
+        completion = await getOpenAI().chat.completions.create({
+          model,
+          messages: withSystemMerged(payload),
+          max_tokens: 400,
+          temperature: 0.7,
+        });
+      }
 
       const reply = cleanReply(completion.choices[0]?.message?.content || "");
       if (reply) return reply;
