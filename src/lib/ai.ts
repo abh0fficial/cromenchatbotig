@@ -1,21 +1,25 @@
 import OpenAI from "openai";
 import { INSTAGRAM_SYSTEM_PROMPT } from "@/lib/system-prompt";
 
-let _openai: OpenAI | null = null;
+/**
+ * Two providers, tried in order:
+ *   1. Google Gemini direct (GEMINI_API_KEY) — fewer hops, generous free tier
+ *   2. OpenRouter (OPENROUTER_API_KEY) — fallback across several models
+ *
+ * Within each provider a model cascade runs, so one retired or rate-limited
+ * model never takes the bot offline.
+ */
 
-function getOpenAI(): OpenAI {
-  if (!_openai) {
-    _openai = new OpenAI({
-      baseURL: "https://openrouter.ai/api/v1",
-      apiKey: process.env.OPENROUTER_API_KEY,
-    });
-  }
-  return _openai;
-}
+const GEMINI_BASE_URL =
+  "https://generativelanguage.googleapis.com/v1beta/openai/";
+const OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1";
 
-// Tried in order. AI_MODEL (if set) goes first, then this cascade — so a
-// rate-limited or retired model never takes the bot offline.
-const DEFAULT_MODELS = [
+const GEMINI_MODELS = [
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+];
+
+const OPENROUTER_MODELS = [
   "google/gemma-4-26b-a4b-it:free",
   "google/gemini-2.0-flash-exp:free",
   "meta-llama/llama-3.3-70b-instruct:free",
@@ -24,16 +28,51 @@ const DEFAULT_MODELS = [
   "mistralai/mistral-small-3.1-24b-instruct:free",
 ];
 
-function getFallbackModels(): string[] {
-  const models = [process.env.AI_MODEL, ...DEFAULT_MODELS].filter(
-    Boolean
-  ) as string[];
-  // De-dupe in case AI_MODEL is already in the cascade
-  return [...new Set(models)];
+const clients = new Map<string, OpenAI>();
+
+function getClient(baseURL: string, apiKey: string): OpenAI {
+  const cached = clients.get(baseURL);
+  if (cached) return cached;
+  const client = new OpenAI({ baseURL, apiKey });
+  clients.set(baseURL, client);
+  return client;
 }
 
-// Retry on transient/availability errors; anything else (bad key, malformed
-// request) is a real bug and should surface.
+type Attempt = { client: OpenAI; model: string; provider: string };
+
+function getAttempts(): Attempt[] {
+  const attempts: Attempt[] = [];
+  const seen = new Set<string>();
+
+  const add = (provider: string, baseURL: string, key: string, models: (string | undefined)[]) => {
+    for (const model of models) {
+      if (!model || seen.has(`${provider}:${model}`)) continue;
+      seen.add(`${provider}:${model}`);
+      attempts.push({ client: getClient(baseURL, key), model, provider });
+    }
+  };
+
+  const geminiKey = process.env.GEMINI_API_KEY;
+  if (geminiKey) {
+    add("gemini", GEMINI_BASE_URL, geminiKey, [
+      process.env.GEMINI_MODEL,
+      ...GEMINI_MODELS,
+    ]);
+  }
+
+  const openrouterKey = process.env.OPENROUTER_API_KEY;
+  if (openrouterKey) {
+    add("openrouter", OPENROUTER_BASE_URL, openrouterKey, [
+      process.env.AI_MODEL,
+      ...OPENROUTER_MODELS,
+    ]);
+  }
+
+  return attempts;
+}
+
+// Retry on transient/availability errors; anything else (malformed request)
+// is a real bug and should surface.
 const RETRYABLE_STATUSES = new Set([402, 404, 408, 429, 500, 502, 503, 504]);
 
 // Some models (Qwen3, DeepSeek R1) emit visible reasoning. Never DM that.
@@ -76,40 +115,45 @@ export async function getAIResponse(
     ...messages,
   ];
 
+  const attempts = getAttempts();
+  if (attempts.length === 0) {
+    console.error("No AI provider configured — set GEMINI_API_KEY or OPENROUTER_API_KEY.");
+  }
+
   const failures: string[] = [];
 
-  for (const model of getFallbackModels()) {
+  for (const { client, model, provider } of attempts) {
+    const label = `${provider}/${model}`;
     try {
+      const params = {
+        model,
+        // Instagram DMs should stay short; also caps free-tier token burn.
+        max_tokens: 400,
+        temperature: 0.7,
+      };
+
       let completion;
       try {
-        completion = await getOpenAI().chat.completions.create({
-          model,
-          messages: payload,
-          // Instagram DMs should stay short; also caps free-tier token burn.
-          max_tokens: 400,
-          temperature: 0.7,
-        });
+        completion = await client.chat.completions.create({ ...params, messages: payload });
       } catch (err: unknown) {
         if (!rejectsSystemRole(err)) throw err;
-        console.warn(`Model ${model} rejected the system role, retrying merged...`);
-        completion = await getOpenAI().chat.completions.create({
-          model,
+        console.warn(`${label} rejected the system role, retrying merged...`);
+        completion = await client.chat.completions.create({
+          ...params,
           messages: withSystemMerged(payload),
-          max_tokens: 400,
-          temperature: 0.7,
         });
       }
 
       const reply = cleanReply(completion.choices[0]?.message?.content || "");
       if (reply) return reply;
 
-      failures.push(`${model}: empty reply`);
-      console.warn(`Model ${model} returned an empty reply, trying next...`);
+      failures.push(`${label}: empty reply`);
+      console.warn(`${label} returned an empty reply, trying next...`);
     } catch (err: unknown) {
       const status = (err as { status?: number }).status;
       if (status !== undefined && !RETRYABLE_STATUSES.has(status)) throw err;
-      failures.push(`${model}: HTTP ${status ?? "network error"}`);
-      console.warn(`Model ${model} failed with ${status ?? "network error"}, trying next...`);
+      failures.push(`${label}: HTTP ${status ?? "network error"}`);
+      console.warn(`${label} failed with ${status ?? "network error"}, trying next...`);
     }
   }
 
@@ -118,8 +162,8 @@ export async function getAIResponse(
   console.error(
     `All ${failures.length} model(s) failed, sending fallback message. ` +
       `Attempts: ${failures.join(" | ")}. ` +
-      `404 = model ID retired or wrong; 429 = rate-limited (add OpenRouter credit); ` +
-      `401 = bad OPENROUTER_API_KEY. Run "npm run doctor" to diagnose.`
+      `404 = model ID retired or wrong; 429 = rate-limited; ` +
+      `401/403 = bad API key. Run "npm run doctor" to diagnose.`
   );
 
   // Keep the lead warm instead of going silent.

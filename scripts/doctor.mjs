@@ -26,6 +26,8 @@ const {
   SUPABASE_SERVICE_ROLE_KEY: SB_KEY,
   OPENROUTER_API_KEY: OR_KEY,
   AI_MODEL,
+  GEMINI_API_KEY: GM_KEY,
+  GEMINI_MODEL,
   INSTAGRAM_ACCESS_TOKEN: IG_TOKEN,
   INSTAGRAM_VERIFY_TOKEN: IG_VERIFY,
 } = process.env;
@@ -40,12 +42,14 @@ console.log("\n── Environment variables ──");
 for (const [name, val] of Object.entries({
   NEXT_PUBLIC_SUPABASE_URL: SB_URL,
   SUPABASE_SERVICE_ROLE_KEY: SB_KEY,
-  OPENROUTER_API_KEY: OR_KEY,
   INSTAGRAM_ACCESS_TOKEN: IG_TOKEN,
   INSTAGRAM_VERIFY_TOKEN: IG_VERIFY,
 })) {
   val ? ok(`${name} set`) : bad(`${name} is MISSING`);
 }
+if (GM_KEY) ok("GEMINI_API_KEY set (primary provider)");
+if (OR_KEY) ok("OPENROUTER_API_KEY set (fallback provider)");
+if (!GM_KEY && !OR_KEY) bad("Set GEMINI_API_KEY and/or OPENROUTER_API_KEY");
 if (failed) { console.log("\nFix the missing variables, then re-run.\n"); process.exit(1); }
 
 // --- 2. Supabase tables ----------------------------------------------------
@@ -63,24 +67,12 @@ for (const table of ["instagram_conversations", "instagram_messages"]) {
   }
 }
 
-// --- 3. OpenRouter: real completion through the live prompt ----------------
-console.log("\n── OpenRouter ──");
-const CASCADE = [
-  AI_MODEL,
-  "google/gemma-4-26b-a4b-it:free",
-  "google/gemini-2.0-flash-exp:free",
-  "meta-llama/llama-3.3-70b-instruct:free",
-  "deepseek/deepseek-chat-v3-0324:free",
-  "qwen/qwen3-8b:free",
-  "mistralai/mistral-small-3.1-24b-instruct:free",
-].filter(Boolean);
-
-let working = null;
-for (const model of [...new Set(CASCADE)]) {
+// --- 3. AI providers: real completions -------------------------------------
+async function probe(baseURL, key, model) {
   try {
-    const r = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const r = await fetch(`${baseURL}/chat/completions`, {
       method: "POST",
-      headers: { Authorization: `Bearer ${OR_KEY}`, "Content-Type": "application/json" },
+      headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
       body: JSON.stringify({
         model,
         max_tokens: 100,
@@ -92,24 +84,58 @@ for (const model of [...new Set(CASCADE)]) {
     });
     const j = await r.json().catch(() => ({}));
     if (r.ok && j.choices?.[0]?.message?.content) {
-      const reply = j.choices[0].message.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-      ok(`${model} → "${reply.slice(0, 80)}"`);
-      working ??= model;
-    } else {
-      warn(`${model} unavailable (HTTP ${r.status}${j.error?.message ? `: ${j.error.message.slice(0, 80)}` : ""})`);
+      return { ok: true, reply: j.choices[0].message.content.replace(/<think>[\s\S]*?<\/think>/gi, "").trim() };
     }
+    return { ok: false, why: `HTTP ${r.status}${j.error?.message ? `: ${j.error.message.slice(0, 90)}` : ""}` };
   } catch (e) {
-    warn(`${model} request failed: ${e.message}`);
+    return { ok: false, why: e.message };
+  }
+}
+
+let anyModelWorks = false;
+
+console.log("\n── Google Gemini (primary) ──");
+if (!GM_KEY) {
+  warn("GEMINI_API_KEY not set, skipping");
+} else {
+  const base = "https://generativelanguage.googleapis.com/v1beta/openai";
+  for (const model of [...new Set([GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.5-flash-lite"].filter(Boolean))]) {
+    const r = await probe(base, GM_KEY, model);
+    if (r.ok) { ok(`${model} → "${r.reply.slice(0, 80)}"`); anyModelWorks = true; }
+    else warn(`${model} unavailable (${r.why})`);
+  }
+  if (!anyModelWorks) bad("Gemini answered nothing — check GEMINI_API_KEY at https://aistudio.google.com/apikey");
+}
+
+console.log("\n── OpenRouter (fallback) ──");
+const CASCADE = [
+  AI_MODEL,
+  "google/gemma-4-26b-a4b-it:free",
+  "google/gemini-2.0-flash-exp:free",
+  "meta-llama/llama-3.3-70b-instruct:free",
+  "deepseek/deepseek-chat-v3-0324:free",
+  "qwen/qwen3-8b:free",
+  "mistralai/mistral-small-3.1-24b-instruct:free",
+].filter(Boolean);
+
+let working = null;
+if (!OR_KEY) {
+  warn("OPENROUTER_API_KEY not set, skipping");
+} else {
+  for (const model of [...new Set(CASCADE)]) {
+    const r = await probe("https://openrouter.ai/api/v1", OR_KEY, model);
+    if (r.ok) { ok(`${model} → "${r.reply.slice(0, 80)}"`); working ??= model; anyModelWorks = true; }
+    else warn(`${model} unavailable (${r.why})`);
   }
 }
 if (working) {
-  ok(`AI is working — first healthy model: ${working}`);
+  ok(`OpenRouter fallback healthy: ${working}`);
   if (AI_MODEL && working !== AI_MODEL) {
     warn(`AI_MODEL="${AI_MODEL}" is not usable; the cascade fell back to ${working}.`);
     warn(`Consider setting AI_MODEL=${working} in .env.local.`);
   }
-} else {
-  bad("No model responded.");
+} else if (OR_KEY && !anyModelWorks) {
+  bad("No model responded on any provider.");
   // Every model failed — find out what this key can actually use.
   try {
     const r = await fetch("https://openrouter.ai/api/v1/models", {
@@ -138,6 +164,8 @@ if (working) {
     warn(`Could not reach the model catalog: ${e.message}`);
   }
 }
+
+if (anyModelWorks) ok("AI is working — the bot can reply.");
 
 // --- 4. Instagram token ----------------------------------------------------
 console.log("\n── Instagram ──");
